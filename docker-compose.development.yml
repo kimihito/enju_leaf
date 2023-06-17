@@ -1,0 +1,134 @@
+version: '3.8'
+
+volumes:
+  postgres:
+  solr:
+  redis:
+  minio:
+  node_modules:
+
+x-app: &app
+  env_file:
+    - .env
+  build:
+    context: .
+    dockerfile: Dockerfile.dev
+  volumes:
+    - ./:/enju:cached
+  depends_on:
+    - postgres
+    - solr
+    - redis
+    # - minio
+
+
+services:
+  runner:
+    <<: *app
+    command: /bin/bash
+  web:
+    <<: *app
+    command: bash -c "rm -f tmp/pids/server.pid && rails s -b 0.0.0.0"
+    working_dir: /enju
+    environment:
+      - WEBPACKER_DEV_SERVER_HOST=webpacker
+    ports:
+      - 3000:3000
+  workers:
+    <<: *app
+    environment:
+      - QUEUE=*
+    command: bundle exec rake resque:work
+
+  webpacker:
+    <<: *app
+    environment:
+      - NODE_ENV=development
+      - WEBPACKER_DEV_SERVER_HOST=127.0.0.1
+    command: ./bin/webpack-dev-server
+    volumes:
+      - node_modules:/enju/node_modules
+    ports:
+      - 3035:3035
+
+  solr:
+    image: solr:8
+    ports:
+      - 8983:8983
+    env_file:
+      - .env
+    volumes:
+      - solr:/var/solr/data
+      - ./solr:/mnt/solr
+    command: bash -c "precreate-core enju_leaf_${RAILS_ENV} /mnt/solr/configsets/sunspot/conf/; precreate-core enju_leaf_test /mnt/solr/configsets/sunspot/conf/; exec solr -f"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8983/solr/enju_leaf_${RAILS_ENV}/admin/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:13
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    env_file:
+      - .env
+    ports:
+      - 5432:5432
+    healthcheck:
+      test: ["CMD-SHELL", "POSTGRES_PASSWORD=${POSTGRES_PASSWORD} pg_isready -U ${POSTGRES_USER} -h localhost -d template1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:6
+    command: redis-server --appendonly yes
+    ports:
+      - 6379:6379
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2023-05-18T00-05-36Z
+    profiles:
+      - develop
+    volumes:
+      - minio:/data
+    entrypoint:
+      /bin/sh -c "mkdir -p /data/${ENJU_LEAF_STORAGE_BUCKET}-${RAILS_ENV} && minio server /data --console-address \":9001\""
+    expose:
+      - 9000
+      - 9001
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  cantaloupe:
+    image: uclalibrary/cantaloupe:5.0.5-4
+    expose:
+      - 8182
+    environment:
+      no_proxy: localhost,web
+      SOURCE_STATIC: HttpSource
+      HTTPSOURCE_BASICLOOKUPSTRATEGY_URL_PREFIX: http://web:3000/picture_files/
+      HTTPSOURCE_BASICLOOKUPSTRATEGY_URL_SUFFIX: '.download?size=original'
+      ENDPOINT_API_ENABLED: 'true'
+      BASE_URI: ${CANTALOUPE_BASE_URI}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8182/health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  tika:
+    image: apache/tika:2.6.0.1
+    ports:
+      - 127.0.0.1:9998:9998
